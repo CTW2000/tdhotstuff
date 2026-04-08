@@ -96,7 +96,15 @@ func New(
 	eventloop.Register(el, func(proposal hotstuff.ProposeMsg) {
 		s.logger.Debugf("Received proposal: %v", proposal.Block)
 
-		// advance the view regardless of vote status
+		// Verify the proposal BEFORE advancing the view.
+		// This prevents byzantine fork proposals (which carry stale QCs)
+		// from disrupting timeout collection by prematurely advancing the view.
+		if err := s.voter.Verify(&proposal); err != nil {
+			s.logger.Infof("failed to verify incoming proposal: %v", err)
+			return
+		}
+
+		// Only advance the view for verified proposals.
 		s.advanceView(hotstuff.NewSyncInfoWith(proposal.Block.QuorumCert()))
 
 		proposalView := proposal.Block.View()
@@ -114,11 +122,6 @@ func New(
 			return
 		}
 
-		// verify the incoming proposal before attempting to vote and try to commit.
-		if err := s.voter.Verify(&proposal); err != nil {
-			s.logger.Infof("failed to verify incoming vote: %v", err)
-			return
-		}
 		err := s.voter.OnValidPropose(&proposal)
 		if err != nil {
 			s.logger.Info(err)
@@ -209,6 +212,15 @@ func (s *Synchronizer) OnLocalTimeout() {
 func (s *Synchronizer) OnRemoteTimeout(timeout hotstuff.TimeoutMsg) {
 	currView := s.state.View()
 	defer s.timeouts.deleteOldViews(currView)
+
+	// Reject timeout messages with views too far ahead of the current view.
+	// This prevents the IncreaseView byzantine attack from polluting the
+	// timeout collector with inflated-view timeouts that desynchronize replicas.
+	const alpha hotstuff.View = 10
+	if timeout.View > currView+alpha {
+		s.logger.Debugf("OnRemoteTimeout: dropping timeout with inflated view %d (current view %d)", timeout.View, currView)
+		return
+	}
 
 	if err := s.auth.Verify(timeout.ViewSignature, timeout.View.ToBytes()); err != nil {
 		s.logger.Infof("View timeout signature could not be verified: %v", err)
